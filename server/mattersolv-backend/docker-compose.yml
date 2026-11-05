@@ -1,0 +1,104 @@
+# mattersolv backend — วางที่ /opt/apps/mattersolv/mattersolv-backend/
+#   .env     = ค่าสำหรับ compose interpolation + IMAGE_TAG (deploy.sh แก้ให้) ไม่ถูกส่งเข้า container
+#   app.env  = env ของแอป (api, migrator) ห้ามใส่รหัส bootstrap/superuser
+# ไม่มี service ไหนเปิดพอร์ตออกนอกเครื่อง ยกเว้น bind 127.0.0.1 (ให้ reverse proxy บนเครื่องเดียวกันต่อเข้า)
+services:
+  db:
+    image: postgres:18.6-alpine
+    restart: always
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_DB: mattersolv_general
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:?set POSTGRES_BOOTSTRAP_PASSWORD in .env}
+      # ใช้เฉพาะตอน init volume ครั้งแรก (10-create-runtime-role.sh) เปลี่ยนภายหลังต้อง ALTER ROLE เอง
+      MIGRATOR_DB_PASSWORD: ${MIGRATOR_DB_PASSWORD:?set MIGRATOR_DB_PASSWORD in .env}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
+      PLATFORM_DB_PASSWORD: ${PLATFORM_DB_PASSWORD:?set PLATFORM_DB_PASSWORD in .env}
+      # ใช้เฉพาะตอน init (สร้าง dev_altpro) ว่าง = ตั้งรหัสผ่านเป็น NULL ล็อกอินด้วยรหัสผ่านไม่ได้
+      DEV_DB_PASSWORD: ${DEV_DB_PASSWORD:-}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mattersolv_general"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./10-create-runtime-role.sh:/docker-entrypoint-initdb.d/10-create-runtime-role.sh:ro
+
+  pgbouncer:
+    # ปักเวอร์ชันไว้ pipeline นี้ไม่ build ตัวนี้ ถ้าแก้ config ต้อง build และเปลี่ยน tag เอง
+    image: registry.gitlab.com/alt-pro-tech/mattersolv/mattersolv_backend/pgbouncer:412b499b3c1e
+    restart: always
+    stop_signal: SIGINT
+    stop_grace_period: 45s
+    environment:
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
+      PLATFORM_DB_PASSWORD: ${PLATFORM_DB_PASSWORD:?set PLATFORM_DB_PASSWORD in .env}
+      PGBOUNCER_MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-500}
+      PGBOUNCER_DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-20}
+      PGBOUNCER_MAX_DB_CONNECTIONS: ${PGBOUNCER_MAX_DB_CONNECTIONS:-40}
+    ports:
+      - "127.0.0.1:6432:6432"
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=$$APP_DB_PASSWORD psql -h 127.0.0.1 -p 6432 -U general_altpro -d mattersolv_general -tAc 'SELECT 1' > /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      db:
+        condition: service_healthy
+
+  redis:
+    image: redis:8.6-alpine
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    image: registry.gitlab.com/alt-pro-tech/mattersolv/mattersolv_backend:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    env_file: app.env
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://general_altpro:${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}@pgbouncer:6432/mattersolv_general
+      PLATFORM_DATABASE_URL: postgresql://platform:${PLATFORM_DB_PASSWORD:?set PLATFORM_DB_PASSWORD in .env}@pgbouncer:6432/mattersolv_general
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "127.0.0.1:8081:8080"
+    # probe รัน "ข้างใน" container จึงยิงพอร์ต 8080 (ไม่ใช่ 8081 ที่เป็นพอร์ตฝั่ง host)
+    # แอปตอบ 3xx (redirect ไป https เมื่อไม่มี X-Forwarded-Proto) จึงใช้ http.client ที่ไม่ตาม redirect: สถานะ <400 = ผ่าน
+    # (urllib.urlopen จะตาม redirect ไป https บนพอร์ต HTTP แล้ว fail ด้วย SSL WRONG_VERSION_NUMBER)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import http.client; c=http.client.HTTPConnection('127.0.0.1',8080,timeout=3); c.request('GET','${API_HEALTH_PATH:-/api/v1/health}'); raise SystemExit(c.getresponse().status>=400)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 35s
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # รันด้วย `docker compose run --rm -T --no-deps migrator` (deploy.sh ทำให้) ไม่ใช่ `up`
+  migrator:
+    image: registry.gitlab.com/alt-pro-tech/mattersolv/mattersolv_backend:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    env_file: app.env
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgresql://migrator:${MIGRATOR_DB_PASSWORD:?set MIGRATOR_DB_PASSWORD in .env}@db:5432/mattersolv_general
+      PLATFORM_DATABASE_URL: postgresql://platform:${PLATFORM_DB_PASSWORD:?set PLATFORM_DB_PASSWORD in .env}@db:5432/mattersolv_general
+    command: ["python", "manage.py", "migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

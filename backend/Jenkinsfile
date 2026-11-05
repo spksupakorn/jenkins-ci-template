@@ -5,7 +5,7 @@ pipeline {
   options {
     disableConcurrentBuilds()
     timestamps()
-    buildDiscarder(logRotator(numToKeepStr: '30'))
+    buildDiscarder(logRotator(daysToKeepStr: '7', numToKeepStr: '10'))
     timeout(time: 30, unit: 'MINUTES')
   }
 
@@ -16,8 +16,10 @@ pipeline {
 
     DEPLOY_HOST = 'deploy@YOUR_SERVER_IP'          // TODO: user@host ของ server
     DEPLOY_CMD  = 'APP_DIR=/opt/apps/mattersolv/mattersolv-backend /opt/apps/mattersolv/deploy.sh'
-    ENV_KEY     = 'BACKEND_TAG'                    // ตัวแปรใน .env ที่ compose ใช้เป็น tag
-    SERVICE     = 'backend'                        // ชื่อ service ใน docker-compose.yml
+    ENV_KEY     = 'IMAGE_TAG'                      // ตัวแปรใน .env ที่ compose ใช้เป็น tag
+    SERVICE     = 'api'                            // ชื่อ service ใน docker-compose.yml
+    MIGRATE_SERVICE = 'migrator'                   // รัน migrate ก่อน up ('' = ไม่รัน)
+    DEPLOY_BRANCH   = 'develop'                    // branch ที่ได้ build/deploy
   }
 
   stages {
@@ -31,6 +33,7 @@ pipeline {
     }
 
     stage('Registry login') {
+      when { expression { (env.GIT_BRANCH ?: '').replaceFirst('^origin/', '') == env.DEPLOY_BRANCH } }
       steps {
         withCredentials([usernamePassword(credentialsId: 'gitlab-registry',
                                           usernameVariable: 'REG_USER',
@@ -41,6 +44,7 @@ pipeline {
     }
 
     stage('Build & Push') {
+      when { expression { (env.GIT_BRANCH ?: '').replaceFirst('^origin/', '') == env.DEPLOY_BRANCH } }
       steps {
         // ใช้สคริปต์เดิมของ repo; IMAGE_NAME / PLATFORM อ่านจาก env
         sh 'bash ./scripts/build-and-push.sh "$TAG"'
@@ -48,16 +52,17 @@ pipeline {
     }
 
     stage('Deploy') {
+      when { expression { (env.GIT_BRANCH ?: '').replaceFirst('^origin/', '') == env.DEPLOY_BRANCH } }
       steps {
         sshagent(credentials: ['deploy-server-ssh']) {
-          sh 'ssh -o BatchMode=yes "$DEPLOY_HOST" "$DEPLOY_CMD" "$ENV_KEY" "$TAG" "$SERVICE"'
+          sh 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$DEPLOY_HOST" "$DEPLOY_CMD" "$ENV_KEY" "$TAG" "$SERVICE" "$MIGRATE_SERVICE"'
         }
+        echo "Deployed ${IMAGE_NAME}:${TAG}"
       }
     }
   }
 
   post {
-    success { echo "Deployed ${IMAGE_NAME}:${TAG}" }
     // ล้าง build cache เก่าบนเครื่อง Jenkins ไม่ให้ดิสก์เต็ม
     always  { sh 'docker builder prune -f --filter "until=72h" || true' }
   }
