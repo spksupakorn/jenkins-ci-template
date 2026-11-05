@@ -1,0 +1,64 @@
+// mattersolv_backend — push ไป develop → build/push image → deploy
+pipeline {
+  agent any
+
+  options {
+    disableConcurrentBuilds()
+    timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    timeout(time: 30, unit: 'MINUTES')
+  }
+
+  environment {
+    REGISTRY    = 'registry.gitlab.com'
+    IMAGE_NAME  = 'registry.gitlab.com/alt-pro-tech/mattersolv/mattersolv_backend'
+    PLATFORM    = 'linux/amd64'
+
+    DEPLOY_HOST = 'deploy@YOUR_SERVER_IP'          // TODO: user@host ของ server
+    DEPLOY_CMD  = 'APP_DIR=/opt/apps/mattersolv/mattersolv-backend /opt/apps/mattersolv/deploy.sh'
+    ENV_KEY     = 'BACKEND_TAG'                    // ตัวแปรใน .env ที่ compose ใช้เป็น tag
+    SERVICE     = 'backend'                        // ชื่อ service ใน docker-compose.yml
+  }
+
+  stages {
+    stage('Prepare') {
+      steps {
+        script {
+          env.TAG = sh(script: 'git rev-parse --short=12 HEAD', returnStdout: true).trim()
+          currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.TAG}"
+        }
+      }
+    }
+
+    stage('Registry login') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'gitlab-registry',
+                                          usernameVariable: 'REG_USER',
+                                          passwordVariable: 'REG_PASS')]) {
+          sh 'echo "$REG_PASS" | docker login "$REGISTRY" -u "$REG_USER" --password-stdin'
+        }
+      }
+    }
+
+    stage('Build & Push') {
+      steps {
+        // ใช้สคริปต์เดิมของ repo; IMAGE_NAME / PLATFORM อ่านจาก env
+        sh 'bash ./scripts/build-and-push.sh "$TAG"'
+      }
+    }
+
+    stage('Deploy') {
+      steps {
+        sshagent(credentials: ['deploy-server-ssh']) {
+          sh 'ssh -o BatchMode=yes "$DEPLOY_HOST" "$DEPLOY_CMD" "$ENV_KEY" "$TAG" "$SERVICE"'
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo "Deployed ${IMAGE_NAME}:${TAG}" }
+    // ล้าง build cache เก่าบนเครื่อง Jenkins ไม่ให้ดิสก์เต็ม
+    always  { sh 'docker builder prune -f --filter "until=72h" || true' }
+  }
+}

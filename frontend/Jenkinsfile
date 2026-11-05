@@ -1,0 +1,77 @@
+// mattersolv_frontend — push ไป develop → build/push image → deploy
+pipeline {
+  agent any
+
+  options {
+    disableConcurrentBuilds()
+    timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    timeout(time: 45, unit: 'MINUTES')
+  }
+
+  environment {
+    REGISTRY  = 'registry.gitlab.com'
+    IMAGE     = 'registry.gitlab.com/alt-pro-tech/mattersolv/mattersolv_frontend'
+
+    // server เป็น amd64 → build แค่ amd64 เร็วกว่ามาก
+    // ถ้าต้องการ arm64 ด้วย ให้ใส่ 'linux/amd64,linux/arm64' และติดตั้ง binfmt บน host ก่อน
+    PLATFORMS = 'linux/amd64'
+
+    // ค่าถูกฝังใน bundle ตอน build — ใส่ URL ของ environment develop
+    NEXT_PUBLIC_API_BASE_URL = 'https://api-dev.example.com/api'   // TODO
+    NEXT_PUBLIC_APP_NAME     = 'MatterSolv'
+
+    // login ทำใน stage ด้านล่างแล้ว ให้สคริปต์ข้าม docker login แบบ interactive
+    SKIP_DOCKER_LOGIN = '1'
+
+    DEPLOY_HOST = 'deploy@YOUR_SERVER_IP'          // TODO
+    DEPLOY_CMD  = 'APP_DIR=/opt/apps/mattersolv/mattersolv-frontend /opt/apps/mattersolv/deploy.sh'
+    ENV_KEY     = 'FRONTEND_TAG'
+    SERVICE     = 'frontend'
+    DEPLOY_BRANCH = 'develop'                      // branch ที่ได้ build/deploy (ที่เดียวใน Jenkinsfile)
+    BUILDER = 'mattersolv-multiarch'               // ต้องตรงกับ default ใน build-and-push-image.sh (สคริปต์อ่าน ${BUILDER:-...})
+  }
+
+  stages {
+    stage('Prepare') {
+      steps {
+        script {
+          env.TAG = sh(script: 'git rev-parse --short=12 HEAD', returnStdout: true).trim()
+          currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.TAG}"
+        }
+      }
+    }
+
+    stage('Registry login') {
+      when { expression { (env.GIT_BRANCH ?: '').replaceFirst('^origin/', '') == env.DEPLOY_BRANCH } }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'gitlab-registry',
+                                          usernameVariable: 'REG_USER',
+                                          passwordVariable: 'REG_PASS')]) {
+          sh 'echo "$REG_PASS" | docker login "$REGISTRY" -u "$REG_USER" --password-stdin'
+        }
+      }
+    }
+
+    stage('Build & Push') {
+      when { expression { (env.GIT_BRANCH ?: '').replaceFirst('^origin/', '') == env.DEPLOY_BRANCH } }
+      steps {
+        sh 'bash ./scripts/build-and-push-image.sh'
+      }
+    }
+
+    stage('Deploy') {
+      when { expression { (env.GIT_BRANCH ?: '').replaceFirst('^origin/', '') == env.DEPLOY_BRANCH } }
+      steps {
+        sshagent(credentials: ['deploy-server-ssh']) {
+          sh 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$DEPLOY_HOST" "$DEPLOY_CMD" "$ENV_KEY" "$TAG" "$SERVICE"'
+        }
+        echo "Deployed ${IMAGE}:${TAG}"
+      }
+    }
+  }
+
+  post {
+    always  { sh 'docker buildx prune -f --builder "$BUILDER" --filter "until=72h" || true' }
+  }
+}
